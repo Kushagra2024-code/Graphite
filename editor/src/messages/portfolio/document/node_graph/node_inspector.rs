@@ -3298,11 +3298,10 @@ pub(crate) fn fill_inspector(node_id: NodeId, context: &mut NodeInspectorContext
 	enum ResolvedFill {
 		Solid(Option<Color>),
 		Gradient {
-			gradient: Gradient,
+			ramp: GradientRamp,
 			gradient_form: GradientForm,
-			settings: GradientSettings,
 			transform: DAffine2,
-			/// Whether the transform input holds a plain value (so the "Reverse Direction" button may write to it) rather than a wire.
+			/// Whether the transform input holds a plain value (so the "Reverse Direction" button and Start/End point inputs may write to it) rather than a wire.
 			transform_is_value: bool,
 		},
 		Other,
@@ -3323,14 +3322,13 @@ pub(crate) fn fill_inspector(node_id: NodeId, context: &mut NodeInspectorContext
 		Ok(document_node) => match document_node.input_value(PaintInput) {
 			Some(TaggedValue::Color(color)) => ResolvedFill::Solid(Some(*color)),
 			Some(value) if value.is_no_paint() => ResolvedFill::Solid(None),
-			Some(TaggedValue::GradientRamp(_)) => {
+			Some(TaggedValue::GradientRamp(ramp)) => {
 				match graph_modification_utils::read_fill_node_gradient(document_node, || {
 					layer.map_or([DVec2::ZERO, DVec2::ONE], |layer| context.network_interface.document_metadata().nonzero_bounding_box(layer))
 				}) {
 					Some(gradient) => ResolvedFill::Gradient {
-						gradient: gradient.stops,
+						ramp: ramp.clone(),
 						gradient_form: gradient.gradient_form,
-						settings: gradient.settings,
 						transform: gradient.transform,
 						transform_is_value: gradient.transform_is_value,
 					},
@@ -3358,15 +3356,16 @@ pub(crate) fn fill_inspector(node_id: NodeId, context: &mut NodeInspectorContext
 	};
 
 	match &fill {
-		ResolvedFill::Gradient { gradient: stops, settings, .. } => {
-			let stops = stops.clone();
-			let settings = *settings;
+		ResolvedFill::Gradient { ramp, .. } => {
+			let stops = Gradient::from(ramp);
+			let cyclic = ramp.gradient_cyclic;
+			let settings = GradientSettings::from(ramp);
 
 			let reverse_button = IconButton::new("Reverse", 24)
 				.tooltip_label("Reverse Stops")
 				.tooltip_description("Reverse the gradient color stops.")
 				.on_update(update_value(
-					move |_| TaggedValue::GradientRamp(GradientRamp::from(stops.reversed(settings.cyclic)).with_settings(settings)),
+					move |_| TaggedValue::GradientRamp(GradientRamp::from(stops.reversed(cyclic)).with_settings(settings)),
 					node_id,
 					PaintInput,
 				))
@@ -3385,7 +3384,7 @@ pub(crate) fn fill_inspector(node_id: NodeId, context: &mut NodeInspectorContext
 				FillChoice::<SRGBA8>::None
 			}
 		}
-		ResolvedFill::Gradient { gradient: stops, settings, .. } => FillChoice::<SRGBA8>::Gradient(GradientRamp::from(stops).with_settings(*settings)),
+		ResolvedFill::Gradient { ramp, .. } => FillChoice::<SRGBA8>::Gradient(ramp.into()),
 		ResolvedFill::Other => FillChoice::<SRGBA8>::None,
 	};
 
@@ -3473,10 +3472,10 @@ pub(crate) fn fill_inspector(node_id: NodeId, context: &mut NodeInspectorContext
 	widgets.push(fill_type_switch);
 
 	if let ResolvedFill::Gradient {
+		ramp,
 		gradient_form,
 		transform,
 		transform_is_value,
-		..
 	} = fill.clone()
 	{
 		// "Reverse Direction" button (assist) beside the Linear/Radial radio. Icon orientation is resolved in viewport
@@ -3532,6 +3531,240 @@ pub(crate) fn fill_inspector(node_id: NodeId, context: &mut NodeInspectorContext
 		]);
 
 		widgets.push(LayoutGroup::row(row));
+
+		if transform_is_value {
+			let start = transform.transform_point2(DVec2::ZERO);
+			let end = transform.transform_point2(DVec2::X);
+
+			let compute_transform = move |basis: DAffine2, new_start: DVec2, mut new_end: DVec2| {
+				if (new_end - new_start).length_squared() < 1e-18 {
+					new_end += DVec2::X * 1e-4;
+				}
+				let mut basis = basis;
+				if !basis.is_finite() || basis.matrix2.determinant().abs() < 1e-9 {
+					basis = DAffine2::IDENTITY;
+				}
+				build_transform_with_y_preservation(basis, new_start, new_end)
+			};
+
+			let set_transform = move |new_transform: DAffine2| Message::Batched {
+				messages: Box::new([
+					NodeGraphMessage::SetInputValue {
+						node_id,
+						input_index: HasTransformInput::INDEX,
+						value: TaggedValue::Bool(true).into(),
+					}
+					.into(),
+					NodeGraphMessage::SetInputValue {
+						node_id,
+						input_index: TransformInput::INDEX,
+						value: TaggedValue::DAffine2(new_transform).into(),
+					}
+					.into(),
+				]),
+			};
+
+			let mut start_row = vec![TextLabel::new("Start").widget_instance()];
+			add_blank_assist(&mut start_row);
+			start_row.extend_from_slice(&[
+				Separator::new(SeparatorStyle::Unrelated).widget_instance(),
+				NumberInput::new(Some(start.x))
+					.label("X")
+					.unit(" px")
+					.on_update(move |input: &NumberInput| {
+						let Some(val) = input.value else { return Message::NoOp };
+						let new_start = DVec2::new(val, start.y);
+						set_transform(compute_transform(transform, new_start, end))
+					})
+					.on_commit(commit_value)
+					.widget_instance(),
+				Separator::new(SeparatorStyle::Related).widget_instance(),
+				NumberInput::new(Some(start.y))
+					.label("Y")
+					.unit(" px")
+					.on_update(move |input: &NumberInput| {
+						let Some(val) = input.value else { return Message::NoOp };
+						let new_start = DVec2::new(start.x, val);
+						set_transform(compute_transform(transform, new_start, end))
+					})
+					.on_commit(commit_value)
+					.widget_instance(),
+			]);
+			widgets.push(LayoutGroup::row(start_row));
+
+			let mut end_row = vec![TextLabel::new("End").widget_instance()];
+			add_blank_assist(&mut end_row);
+			end_row.extend_from_slice(&[
+				Separator::new(SeparatorStyle::Unrelated).widget_instance(),
+				NumberInput::new(Some(end.x))
+					.label("X")
+					.unit(" px")
+					.on_update(move |input: &NumberInput| {
+						let Some(val) = input.value else { return Message::NoOp };
+						let new_end = DVec2::new(val, end.y);
+						set_transform(compute_transform(transform, start, new_end))
+					})
+					.on_commit(commit_value)
+					.widget_instance(),
+				Separator::new(SeparatorStyle::Related).widget_instance(),
+				NumberInput::new(Some(end.y))
+					.label("Y")
+					.unit(" px")
+					.on_update(move |input: &NumberInput| {
+						let Some(val) = input.value else { return Message::NoOp };
+						let new_end = DVec2::new(end.x, val);
+						set_transform(compute_transform(transform, start, new_end))
+					})
+					.on_commit(commit_value)
+					.widget_instance(),
+			]);
+			widgets.push(LayoutGroup::row(end_row));
+		}
+
+		let update_ramp = move |new_ramp: GradientRamp| Message::Batched {
+			messages: Box::new([
+				NodeGraphMessage::SetInputValue {
+					node_id,
+					input_index: PaintInput::INDEX,
+					value: TaggedValue::GradientRamp(new_ramp.clone()).into(),
+				}
+				.into(),
+				NodeGraphMessage::SetInputValue {
+					node_id,
+					input_index: BackupGradientInput::INDEX,
+					value: TaggedValue::GradientRamp(new_ramp).into(),
+				}
+				.into(),
+			]),
+		};
+
+		let spread_entries: Vec<_> = RadioEntryData::list_from_choice_type({
+			let ramp = ramp.clone();
+			move |gradient_spread: GradientSpread| {
+				let mut new_ramp = ramp.clone();
+				new_ramp.gradient_spread = gradient_spread;
+				update_ramp(new_ramp)
+			}
+		})
+		.into_iter()
+		.map(|entry| entry.on_commit(commit_value))
+		.collect();
+
+		let mut ends_row = vec![
+			TextLabel::new("Ends")
+				.tooltip_label("Gradient Spread / Cyclic")
+				.tooltip_description("The method for how the gradient continues beyond its ends, and whether its stops cycle back around from last to first.")
+				.widget_instance(),
+		];
+		add_blank_assist(&mut ends_row);
+		ends_row.extend_from_slice(&[
+			Separator::new(SeparatorStyle::Unrelated).widget_instance(),
+			RadioInput::new(spread_entries).narrow(true).selected_index(Some(ramp.gradient_spread as u32)).widget_instance(),
+			Separator::new(SeparatorStyle::Unrelated).widget_instance(),
+			CheckboxInput::new(ramp.gradient_cyclic)
+				.icon("Link")
+				.tooltip_label("Cyclic")
+				.tooltip_description("Treats the stops as a cycle, interpolating from the last stop back around to the first.")
+				.on_update({
+					let ramp = ramp.clone();
+					move |checkbox: &CheckboxInput| {
+						let new_ramp = ramp.clone().with_cyclic(checkbox.checked);
+						update_ramp(new_ramp)
+					}
+				})
+				.on_commit(commit_value)
+				.widget_instance(),
+		]);
+		widgets.push(LayoutGroup::row(ends_row));
+
+		let space_entries: Vec<_> = MenuListEntry::sections_from_choice_type({
+			let ramp = ramp.clone();
+			move |gradient_space: GradientSpace| {
+				let mut new_ramp = ramp.clone();
+				new_ramp.gradient_space = gradient_space;
+				update_ramp(new_ramp)
+			}
+		})
+		.into_iter()
+		.map(|section| section.into_iter().map(|entry| entry.on_commit(commit_value)).collect())
+		.collect();
+
+		let mut space_row = vec![
+			TextLabel::new("Space")
+				.tooltip_label("Gradient Space")
+				.tooltip_description("The color space where stops interpolate toward their neighbors.")
+				.widget_instance(),
+		];
+		add_blank_assist(&mut space_row);
+		space_row.extend_from_slice(&[
+			Separator::new(SeparatorStyle::Unrelated).widget_instance(),
+			DropdownInput::new(space_entries)
+				.selected_index(Some(ramp.gradient_space as u32))
+				.tooltip_label("Gradient Space")
+				.tooltip_description("The color space where stops interpolate toward their neighbors.")
+				.widget_instance(),
+		]);
+		widgets.push(LayoutGroup::row(space_row));
+
+		let interp_entries: Vec<_> = MenuListEntry::sections_from_choice_type({
+			let ramp = ramp.clone();
+			move |gradient_interpolation: GradientInterpolation| {
+				let mut new_ramp = ramp.clone();
+				new_ramp.gradient_interpolation = gradient_interpolation;
+				update_ramp(new_ramp)
+			}
+		})
+		.into_iter()
+		.map(|section| section.into_iter().map(|entry| entry.on_commit(commit_value)).collect())
+		.collect();
+
+		let mut interp_row = vec![
+			TextLabel::new("Intrp.")
+				.tooltip_label("Gradient Interpolation")
+				.tooltip_description("The path the stops interpolate along, deciding whether the gradient jumps, turns corners, or flows smoothly through them.")
+				.widget_instance(),
+		];
+		add_blank_assist(&mut interp_row);
+		interp_row.extend_from_slice(&[
+			Separator::new(SeparatorStyle::Unrelated).widget_instance(),
+			DropdownInput::new(interp_entries)
+				.selected_index(Some(ramp.gradient_interpolation as u32))
+				.tooltip_label("Gradient Interpolation")
+				.tooltip_description("The path the stops interpolate along, deciding whether the gradient jumps, turns corners, or flows smoothly through them.")
+				.widget_instance(),
+		]);
+		widgets.push(LayoutGroup::row(interp_row));
+
+		if ramp.gradient_space.is_polar() {
+			let hue_entries: Vec<_> = MenuListEntry::sections_from_choice_type({
+				let ramp = ramp.clone();
+				move |gradient_hue_direction: GradientHueDirection| {
+					let mut new_ramp = ramp.clone();
+					new_ramp.gradient_hue_direction = gradient_hue_direction;
+					update_ramp(new_ramp)
+				}
+			})
+			.into_iter()
+			.map(|section| section.into_iter().map(|entry| entry.on_commit(commit_value)).collect())
+			.collect();
+
+			let mut arc_row = vec![
+				TextLabel::new("Arc")
+					.tooltip_label("Gradient Hue Direction")
+					.tooltip_description("Which way around the hue wheel the stops interpolate.")
+					.widget_instance(),
+			];
+			add_blank_assist(&mut arc_row);
+			arc_row.extend_from_slice(&[
+				Separator::new(SeparatorStyle::Unrelated).widget_instance(),
+				DropdownInput::new(hue_entries)
+					.selected_index(Some(ramp.gradient_hue_direction as u32))
+					.tooltip_label("Gradient Hue Direction")
+					.tooltip_description("Which way around the hue wheel the stops interpolate.")
+					.widget_instance(),
+			]);
+			widgets.push(LayoutGroup::row(arc_row));
+		}
 	}
 
 	widgets
