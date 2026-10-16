@@ -1,6 +1,6 @@
 use crate::messages::portfolio::document::utility_types::misc::{GridLevels, GridSnapping, GridType, SnappingState};
 use crate::messages::prelude::*;
-use glam::DVec2;
+use glam::{DAffine2, DVec2};
 use snapping::{Grid, Settings};
 
 /// The kinds of snap to offer, going by the document's snapping options.
@@ -49,14 +49,18 @@ fn grid_at_level(document: &DocumentMessageHandler, level: impl Fn(&GridLevels) 
 			Grid::new(origin, levels.families(level(&levels)))
 		}
 		GridType::Isometric { y_axis_spacing, angle_a, angle_b } => {
+			if !state.grid.angle.is_finite() {
+				return None;
+			}
 			let slopes = [-angle_a.to_radians().tan(), angle_b.to_radians().tan()];
 			let spread = slopes[1] - slopes[0];
 			let multiplier = GridSnapping::compute_isometric_multiplier(y_axis_spacing, spread, &document.document_ptz)?;
 
 			// The slanted lines are spaced along Y, which is further apart than they are straight across
 			let along_y = y_axis_spacing.abs() * multiplier;
-			let slanted = slopes.map(|slope| (DVec2::new(1., slope), along_y / slope.hypot(1.)));
-			Grid::new(origin, [(DVec2::Y, along_y / spread), slanted[0], slanted[1]])
+			let rotation = DAffine2::from_angle(state.grid.angle.to_radians());
+			let slanted = slopes.map(|slope| (rotation.transform_vector2(DVec2::new(1., slope)), along_y / slope.hypot(1.)));
+			Grid::new(origin, [(rotation.transform_vector2(DVec2::Y), along_y / spread), slanted[0], slanted[1]])
 		}
 	}
 }
@@ -184,6 +188,43 @@ mod tests {
 			let steps = point.dot(axis) / spacing;
 			assert!((steps - steps.round()).abs() < 1e-9, "{point:?} is off a line by {steps}");
 		}
+	}
+
+	#[test]
+	fn a_turned_isometric_grid_has_its_lines_along_the_turned_directions() {
+		let mut document = DocumentMessageHandler::default();
+		document.snapping_state.grid_snapping = true;
+		document.snapping_state.grid.grid_type = GridType::Isometric {
+			y_axis_spacing: 30.,
+			angle_a: 30.,
+			angle_b: 30.,
+		};
+		document.snapping_state.grid.angle = 45.;
+
+		let usable_grid = grid(&document).expect("the grid should be usable");
+
+		let turn = DAffine2::from_angle(45_f64.to_radians());
+		let tan_30 = 30_f64.to_radians().tan();
+		let upright = turn.transform_vector2(DVec2::Y);
+		let slanted_a = turn.transform_vector2(DVec2::new(1., -tan_30).normalize());
+		let slanted_b = turn.transform_vector2(DVec2::new(1., tan_30).normalize());
+
+		assert!(usable_grid.families()[0].direction.abs_diff_eq(upright, 1e-9));
+		assert!(usable_grid.families()[1].direction.abs_diff_eq(slanted_a, 1e-9));
+		assert!(usable_grid.families()[2].direction.abs_diff_eq(slanted_b, 1e-9));
+
+		// Snapping lands on lines of the turned grid
+		let point = usable_grid.nearest_point(DVec2::new(123., -45.));
+		for family in usable_grid.families() {
+			let steps = point.dot(family.direction.perp()) / family.spacing;
+			assert!((steps - steps.round()).abs() < 1e-9, "{point:?} is off a line by {steps}");
+		}
+
+		// A non-finite angle yields no usable grid
+		document.snapping_state.grid.angle = f64::NAN;
+		assert!(grid(&document).is_none());
+		document.snapping_state.grid.angle = f64::INFINITY;
+		assert!(grid(&document).is_none());
 	}
 
 	#[test]

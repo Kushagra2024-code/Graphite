@@ -119,8 +119,9 @@ fn grid_overlay_rectangular_dot(overlay_context: &mut OverlayContext, view: &Vie
 	overlay_context.dots(&major, DOT_SIZE, Some(color));
 }
 
-fn grid_overlay_isometric(document: &DocumentMessageHandler, overlay_context: &mut OverlayContext, view: &View, origin: DVec2, y_axis_spacing: f64, angle_a: f64, angle_b: f64) {
-	let grid_color = document.snapping_state.grid.color.as_str();
+fn grid_overlay_isometric(document: &DocumentMessageHandler, overlay_context: &mut OverlayContext, view: &View, origin: DVec2, y_axis_spacing: f64, (angle_a, angle_b): (f64, f64)) {
+	let grid = &document.snapping_state.grid;
+	let grid_color = grid.color.as_str();
 	let tan_a = angle_a.to_radians().tan();
 	let tan_b = angle_b.to_radians().tan();
 	let spacing = DVec2::new(y_axis_spacing / (tan_a + tan_b), y_axis_spacing);
@@ -129,18 +130,28 @@ fn grid_overlay_isometric(document: &DocumentMessageHandler, overlay_context: &m
 	};
 	let isometric_spacing = spacing * spacing_multiplier;
 
-	draw_line_family(overlay_context, view, origin, DVec2::Y, isometric_spacing.x, None, grid_color);
+	let rotation = DAffine2::from_angle(grid.angle.to_radians());
+	draw_line_family(overlay_context, view, origin, rotation.transform_vector2(DVec2::Y), isometric_spacing.x, None, grid_color);
 
 	// The slanted lines are spaced along Y, which is further apart than they are straight across
 	for slope in [-tan_a, tan_b] {
 		let Some(direction) = DVec2::new(1., slope).try_normalize() else { continue };
-		draw_line_family(overlay_context, view, origin, direction, isometric_spacing.y / slope.hypot(1.), None, grid_color);
+		draw_line_family(
+			overlay_context,
+			view,
+			origin,
+			rotation.transform_vector2(direction),
+			isometric_spacing.y / slope.hypot(1.),
+			None,
+			grid_color,
+		);
 	}
 }
 
 /// Draws a dot where the isometric grid's lines cross, over the part of the document in view.
-fn grid_overlay_isometric_dot(document: &DocumentMessageHandler, overlay_context: &mut OverlayContext, view: &View, origin: DVec2, y_axis_spacing: f64, angle_a: f64, angle_b: f64) {
-	let grid_color = document.snapping_state.grid.color.as_str();
+fn grid_overlay_isometric_dot(document: &DocumentMessageHandler, overlay_context: &mut OverlayContext, view: &View, origin: DVec2, y_axis_spacing: f64, (angle_a, angle_b): (f64, f64)) {
+	let grid = &document.snapping_state.grid;
+	let grid_color = grid.color.as_str();
 	let tan_a = angle_a.to_radians().tan();
 	let tan_b = angle_b.to_radians().tan();
 	let spacing = DVec2::new(y_axis_spacing / (tan_a + tan_b), y_axis_spacing);
@@ -149,16 +160,23 @@ fn grid_overlay_isometric_dot(document: &DocumentMessageHandler, overlay_context
 	};
 	let spacing = spacing * spacing_multiplier;
 
-	// The dots stand in columns on the vertical lines, each column starting lower than the last along the slope of the first slanted lines
+	let rotation = DAffine2::from_angle(grid.angle.to_radians());
+	let column_direction = rotation.transform_vector2(DVec2::Y);
+	let column_across = rotation.transform_vector2(DVec2::X);
+	let column_step = rotation.transform_vector2(DVec2::new(1., -tan_a) * spacing.x);
+
+	// The dots stand in columns on the upright lines, each column starting lower than the last along the slope of the first slanted lines
 	// O(dots in view), which the coarsening of the spacing keeps to around the viewport's area over 100 square pixels
-	let Some((first_x, last_x)) = view.steps_in_view(origin, DVec2::X, spacing.x) else { return };
+	let Some((first_x, last_x)) = view.steps_in_view(origin, column_across, spacing.x) else { return };
 	let mut dots = Vec::new();
 	for x in (first_x as i64)..=(last_x as i64) {
-		let column = origin + DVec2::new(1., -tan_a) * (x as f64 * spacing.x);
-		let Some((first_y, last_y)) = view.steps_in_view(column, DVec2::Y, spacing.y) else { continue };
+		let column = origin + column_step * (x as f64);
+		let Some((first_y, last_y)) = view.steps_in_view(column, column_direction, spacing.y) else {
+			continue;
+		};
 
 		for y in (first_y as i64)..=(last_y as i64) {
-			let dot = view.document_to_viewport.transform_point2(column + DVec2::Y * (y as f64 * spacing.y));
+			let dot = view.document_to_viewport.transform_point2(column + column_direction * (y as f64 * spacing.y));
 			if dot.cmpge(DVec2::ZERO).all() && dot.cmple(view.size).all() {
 				dots.push(dot);
 			}
@@ -172,7 +190,7 @@ pub fn grid_overlay(document: &DocumentMessageHandler, overlay_context: &mut Ove
 	let grid = &document.snapping_state.grid;
 	let view = View::new(document, overlay_context);
 	let origin = grid.effective_origin(document);
-	if !origin.is_finite() {
+	if !origin.is_finite() || !grid.angle.is_finite() {
 		return;
 	}
 
@@ -188,9 +206,9 @@ pub fn grid_overlay(document: &DocumentMessageHandler, overlay_context: &mut Ove
 		}
 		GridType::Isometric { y_axis_spacing, angle_a, angle_b } => {
 			if grid.dot_display {
-				grid_overlay_isometric_dot(document, overlay_context, &view, origin, y_axis_spacing, angle_a, angle_b)
+				grid_overlay_isometric_dot(document, overlay_context, &view, origin, y_axis_spacing, (angle_a, angle_b))
 			} else {
-				grid_overlay_isometric(document, overlay_context, &view, origin, y_axis_spacing, angle_a, angle_b)
+				grid_overlay_isometric(document, overlay_context, &view, origin, y_axis_spacing, (angle_a, angle_b))
 			}
 		}
 	}
@@ -383,18 +401,6 @@ pub fn overlay_options(snapping_state: &SnappingState) -> Vec<LayoutGroup> {
 					}))
 					.widget_instance(),
 			]));
-			widgets.push(LayoutGroup::row(vec![
-				label("Angle"),
-				Separator::new(SeparatorStyle::Unrelated).widget_instance(),
-				NumberInput::new(Some(grid.angle))
-					.unit("°")
-					.mode(NumberInputMode::Range)
-					.range_min(Some(-180.))
-					.range_max(Some(180.))
-					.sizing(WidgetSizing::default().min_width(200))
-					.on_update(update_number(grid, |grid| Some(&mut grid.angle)))
-					.widget_instance(),
-			]));
 		}
 		GridType::Isometric { y_axis_spacing, angle_a, angle_b } => {
 			widgets.push(LayoutGroup::row(vec![
@@ -428,6 +434,19 @@ pub fn overlay_options(snapping_state: &SnappingState) -> Vec<LayoutGroup> {
 			]));
 		}
 	}
+
+	widgets.push(LayoutGroup::row(vec![
+		label("Angle"),
+		Separator::new(SeparatorStyle::Unrelated).widget_instance(),
+		NumberInput::new(Some(grid.angle))
+			.unit("°")
+			.mode(NumberInputMode::Range)
+			.range_min(Some(-180.))
+			.range_max(Some(180.))
+			.sizing(WidgetSizing::default().min_width(200))
+			.on_update(update_number(grid, |grid| Some(&mut grid.angle)))
+			.widget_instance(),
+	]));
 
 	widgets
 }

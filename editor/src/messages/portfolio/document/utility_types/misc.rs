@@ -221,7 +221,7 @@ pub struct GridSnapping {
 	pub dot_display: bool,
 	/// How many parts minor lines split each space between major lines of a rectangular grid into, where 1 draws none.
 	pub subdivisions: u32,
-	/// How far a rectangular grid is turned, in degrees.
+	/// How far a rectangular or isometric grid is turned, in degrees.
 	pub angle: f64,
 	/// Whether `origin` is an offset from the top left corner of the active artboard, rather than a document position.
 	pub origin_follows_artboard: bool,
