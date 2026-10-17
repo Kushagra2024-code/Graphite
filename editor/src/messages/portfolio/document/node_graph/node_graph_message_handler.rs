@@ -457,10 +457,8 @@ impl<'a> MessageHandler<NodeGraphMessage, NodeGraphMessageContext<'a>> for NodeG
 					log::error!("Failed to find upstream node for downstream_input");
 					return;
 				};
-				responses.add(NodeGraphMessage::CreateWire {
-					output_connector: upstream_node,
-					input_connector,
-				});
+				network_interface.disconnect_input(&downstream_input, selection_network_path);
+				network_interface.create_wire(&upstream_node, &input_connector, selection_network_path);
 			}
 			NodeGraphMessage::Cut => responses.add(ClipboardMessage::CutLayers),
 			NodeGraphMessage::DeleteNodes { node_ids, delete_children } => {

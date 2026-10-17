@@ -3033,4 +3033,78 @@ mod test_pen_tool {
 		let outgoing = editor.active_document().metadata().transform_to_viewport(layer).transform_point2(outgoing);
 		assert!(outgoing.distance(handle + travel) < 1e-6, "the handle is at {outgoing} rather than {}", handle + travel);
 	}
+
+	#[tokio::test]
+	async fn merging_paths_positions_merged_content_nodes_cleanly() {
+		use crate::consts::{NODE_CHAIN_WIDTH, STACK_VERTICAL_GAP};
+		use crate::messages::portfolio::document::utility_types::network_interface::{FlowType, InputConnector};
+		use glam::IVec2;
+
+		let mut editor = EditorTestUtils::create();
+		editor.new_document().await;
+
+		// Create first path
+		click_pen(&mut editor, A).await;
+		click_pen(&mut editor, B).await;
+		editor.press(Key::Enter, ModifierKeys::empty()).await;
+
+		// Create second path
+		click_pen(&mut editor, D).await;
+		click_pen(&mut editor, C).await;
+		editor.press(Key::Enter, ModifierKeys::empty()).await;
+
+		// Create third path (stacked below second path)
+		click_pen(&mut editor, DVec2::new(300., 300.)).await;
+		click_pen(&mut editor, DVec2::new(400., 300.)).await;
+		editor.press(Key::Enter, ModifierKeys::empty()).await;
+
+		let layers_before: Vec<_> = editor.active_document().metadata().all_layers().collect();
+		assert_eq!(layers_before.len(), 3, "Expected 3 layers before merge");
+		let first_layer = layers_before[0];
+		let second_layer = layers_before[1];
+		let third_layer = layers_before[2];
+
+		// Merge first and second path directly using merge_layers
+		let mut responses = std::collections::VecDeque::new();
+		crate::messages::tool::common_functionality::graph_modification_utils::merge_layers(editor.active_document(), first_layer, second_layer, &mut responses);
+		for message in responses {
+			editor.handle_message(message).await;
+		}
+
+		let document = editor.active_document();
+		let network = &document.network_interface;
+
+		// Find the Merge node in the first layer's chain
+		let merge_identifier = DefinitionIdentifier::Network("Merge".into());
+		let merge_id = network
+			.upstream_flow_back_from_nodes(vec![first_layer.to_node()], &[], FlowType::HorizontalFlow)
+			.find(|node_id| !network.is_layer(node_id, &[]) && network.reference(node_id, &[]).as_ref() == Some(&merge_identifier))
+			.expect("Expected a Merge node in first layer's chain");
+
+		let merge_pos = network.position(&merge_id, &[]).expect("Merge node should have a position");
+
+		// Feeder connected to the secondary input of Merge
+		let feeder_node = network
+			.upstream_output_connector(&InputConnector::layer_secondary_input(merge_id), &[])
+			.and_then(|oc| oc.node_id())
+			.expect("Merge node should have a feeder connected to its secondary input");
+
+		let feeder_pos = network.position(&feeder_node, &[]).expect("Feeder node should have a position");
+
+		// The feeder node must be one node width to the left of Merge on the row below
+		assert_eq!(
+			feeder_pos,
+			merge_pos + IVec2::new(-NODE_CHAIN_WIDTH, STACK_VERTICAL_GAP),
+			"Feeder node should sit one node width to the left of Merge on the row below"
+		);
+
+		// The third layer must not collide with or collapse into the merged content row
+		let third_layer_pos = network.position(&third_layer.to_node(), &[]).expect("Third layer should have a position");
+		assert!(
+			third_layer_pos.y >= feeder_pos.y + STACK_VERTICAL_GAP,
+			"Third layer at y={} must sit below merged content row at y={}",
+			third_layer_pos.y,
+			feeder_pos.y
+		);
+	}
 }

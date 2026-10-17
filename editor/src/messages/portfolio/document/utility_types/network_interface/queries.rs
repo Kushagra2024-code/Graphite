@@ -478,9 +478,9 @@ impl NodeNetworkInterface {
 				.upstream_flow_back_from_nodes(vec![potential_upstream_node], network_path, FlowType::UpstreamFlow)
 				.collect::<Vec<_>>()
 			{
-				// A path terminates at an already-verified sole dependent or at the left input to the chain
+				// A path terminates at an already-verified sole dependent, at the left input to the chain, or at a node in the chain
 				let is_sole_dependent = self.is_sole_dependent(upstream_node_from_input, network_path, |downstream_node, input_index| {
-					if sole_dependents.contains(&downstream_node) || downstream_node == *node_id && input_index == 1 {
+					if sole_dependents.contains(&downstream_node) || (downstream_node == *node_id && input_index == 1) || upstream_nodes_below_layer.contains(&downstream_node) {
 						SoleDependentStep::Terminate
 					} else {
 						SoleDependentStep::Continue

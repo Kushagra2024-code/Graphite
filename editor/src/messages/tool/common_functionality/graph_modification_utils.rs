@@ -1,3 +1,4 @@
+use crate::consts::NODE_CHAIN_WIDTH;
 use crate::messages::portfolio::document::graph_operation::utility_types::TransformIn;
 use crate::messages::portfolio::document::node_graph::document_node_definitions::{self, DefinitionIdentifier};
 use crate::messages::portfolio::document::utility_types::document_metadata::LayerNodeIdentifier;
@@ -72,6 +73,18 @@ pub fn merge_layers(document: &DocumentMessageHandler, first_layer: LayerNodeIde
 		parent: first_layer_parent,
 		insert_index: first_layer_index + 1,
 	});
+
+	// Collect the nodes in the second layer's content chain so they can be shifted horizontally to align with the merge node
+	let mut second_layer_content_nodes = document.network_interface.upstream_nodes_below_layer(&second_layer.to_node(), &[]);
+	if let Some(output_node) = document
+		.network_interface
+		.upstream_output_connector(&InputConnector::layer_secondary_input(second_layer.to_node()), &[])
+		.and_then(|oc| oc.node_id())
+	{
+		for upstream_node in document.network_interface.upstream_flow_back_from_nodes(vec![output_node], &[], FlowType::UpstreamFlow) {
+			second_layer_content_nodes.insert(upstream_node);
+		}
+	}
 
 	// Merge the inputs of the two layers
 	let merge_node_id = NodeId::new();
@@ -156,6 +169,13 @@ pub fn merge_layers(document: &DocumentMessageHandler, first_layer: LayerNodeIde
 		node_id: transform_node_id,
 		parent: first_layer,
 	});
+
+	// Shift the merged content nodes horizontally so the rightmost node sits one node width to the left of the Merge node
+	let merge_distance_from_layer = if current_and_other_layer_is_spline { 5 } else { 4 };
+	let shift_x = -merge_distance_from_layer * NODE_CHAIN_WIDTH;
+	for node_id in second_layer_content_nodes {
+		responses.add(NodeGraphMessage::ShiftNodePosition { node_id, x: shift_x, y: 0 });
+	}
 
 	responses.add(NodeGraphMessage::RunDocumentGraph);
 	responses.add(DeferMessage::AfterGraphRun {

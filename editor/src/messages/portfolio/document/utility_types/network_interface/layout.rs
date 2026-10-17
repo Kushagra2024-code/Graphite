@@ -855,7 +855,7 @@ impl NodeNetworkInterface {
 
 	/// The grid rows a node occupies when stacked, as absolute `(top, bottom)` rows. A layer's box starts
 	/// one row above its position and reaches `STACK_VERTICAL_GAP` below it; a node spans two rows down.
-	fn stacked_box_rows(&self, node_id: &NodeId, network_path: &[NodeId]) -> Option<(i32, i32)> {
+	pub(crate) fn stacked_box_rows(&self, node_id: &NodeId, network_path: &[NodeId]) -> Option<(i32, i32)> {
 		let position = self.position(node_id, network_path)?;
 
 		Some(if self.is_layer(node_id, network_path) {

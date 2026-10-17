@@ -983,7 +983,25 @@ impl NodeNetworkInterface {
 				log::error!("Could not get disconnected node position in remove_references_from_network");
 				return false;
 			};
-			let max_shift_distance = reconnected_node_position.y - disconnected_node_position.y;
+			let mut min_y = disconnected_node_position.y;
+			if let Some(downstream_layer_id) = self
+				.with_outward_wires(network_path, |outward_wires| {
+					outward_wires
+						.get(&OutputConnector::primary_output(*reconnect_node))
+						.and_then(|wires| wires.iter().find_map(|input| input.node_id()))
+				})
+				.flatten()
+				.filter(|id| self.is_layer(id, network_path))
+			{
+				for (_, bottom) in self
+					.upstream_nodes_below_layer(&downstream_layer_id, network_path)
+					.iter()
+					.filter_map(|node_id| self.stacked_box_rows(node_id, network_path))
+				{
+					min_y = min_y.max(bottom + 1);
+				}
+			}
+			let max_shift_distance = (reconnected_node_position.y - min_y).max(0);
 
 			let upstream_nodes = self.upstream_flow_back_from_nodes(vec![*reconnect_node], network_path, FlowType::PrimaryFlow).collect::<HashSet<_>>();
 
