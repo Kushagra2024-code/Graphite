@@ -1827,7 +1827,9 @@ pub async fn combine_paths(_: impl Ctx, content: List<Graphic>) -> Item<Vector> 
 		let source_transform = flattened.attribute_cloned_or_default(ATTR_TRANSFORM, index);
 		output.concat(element, source_transform, collision_hash_seed);
 
-		primary_source = Some((index, source_transform));
+		if primary_source.is_none() {
+			primary_source = Some((index, source_transform));
+		}
 	}
 
 	if let Some((primary, source_transform)) = primary_source {
@@ -1835,7 +1837,7 @@ pub async fn combine_paths(_: impl Ctx, content: List<Graphic>) -> Item<Vector> 
 		let mut attributes = ItemAttributeValues::new();
 
 		attributes.insert_cloned_from(&source_attributes, ATTR_APPEARANCE);
-		// Adopt the last input item's layer (if any) so the editor can also bucket clicks under a contributing child layer
+		// Adopt the primary input item's layer (if any) so the editor can also bucket clicks under a contributing child layer
 		attributes.insert_cloned_from(&source_attributes, ATTR_EDITOR_LAYER_PATH);
 		bake_paint_transforms(&mut attributes, source_transform);
 
@@ -4320,5 +4322,35 @@ mod test {
 			pathseg_abs_diff_eq(rounded[0].segments().next().unwrap(), line.segments().next().unwrap(), 1e-9),
 			"a subpath too short to have corners should stay where it was"
 		);
+	}
+
+	#[tokio::test]
+	async fn combine_paths_prefers_primary_input_appearance() {
+		let rect = || {
+			let mut v = Vector::default();
+			v.append_bezpath(Rect::new(0., 0., 100., 100.).to_path(DEFAULT_ACCURACY));
+			v
+		};
+
+		let solid_fill = |color: Color| Appearance::new_single(Coverage::new_fill(), Graphic::from(List::new_from_element(color)));
+		let item_a = Item::new_from_element(rect())
+			.with_attribute(ATTR_TRANSFORM, DAffine2::IDENTITY)
+			.with_attribute(ATTR_APPEARANCE, solid_fill(Color::RED));
+		let item_b = Item::new_from_element(rect())
+			.with_attribute(ATTR_TRANSFORM, DAffine2::from_translation((100., 100.).into()))
+			.with_attribute(ATTR_APPEARANCE, solid_fill(Color::BLUE));
+
+		let mut content = List::new_from_item(item_a);
+		content.push(item_b);
+
+		let combined = super::combine_paths(Footprint::default(), embed_vectors(content)).await;
+		let appearance = combined.attribute::<Appearance>(ATTR_APPEARANCE).expect("Combined path should retain appearance");
+		let fill = appearance.first_paint_of(Cover::Fill).expect("Combined path should have fill paint");
+
+		let Graphic::ColorList(color_list) = fill else {
+			panic!("Expected a solid color fill, got {fill:?}");
+		};
+		let color = *color_list.element(0).expect("Color present");
+		assert_eq!(color, Color::RED, "Appearance should come from the primary (first) input");
 	}
 }
