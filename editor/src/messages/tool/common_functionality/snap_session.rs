@@ -92,6 +92,15 @@ pub struct PointOptions {
 	pub box_features: Option<BoxFeatures>,
 	/// Whether the grid is left out, as for a turn, which the grid would otherwise step at odd angles.
 	pub ignores_grid: bool,
+	/// Tracks along the path's own direction from unselected neighbors.
+	pub extension_tracks: [Option<ExtensionTrack>; 4],
+}
+
+/// A track offered along the path's own direction from an unselected neighbor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExtensionTrack {
+	pub line: Locus,
+	pub reference: DVec2,
 }
 
 /// Which features of a gesture make up a box.
@@ -289,6 +298,17 @@ impl SnapSession {
 			}
 			if document.snapping_state.bounding_box.equal_sizes {
 				find_equal_sizes(&context, spaced, &mut particular);
+			}
+		}
+
+		if settings.extensions && !silenced {
+			for (index, track) in options.extension_tracks.into_iter().flatten().enumerate() {
+				let key = CandidateKey {
+					kind: Kind::Extension,
+					feature: lead as u32,
+					identity: [u64::MAX - index as u64, 0, 0],
+				};
+				particular.push(Candidate::track(key, track.line).with_reference(track.reference));
 			}
 		}
 

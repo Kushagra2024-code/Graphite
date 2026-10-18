@@ -20,7 +20,7 @@ use crate::messages::tool::common_functionality::pivot::{PivotGizmo, PivotGizmoT
 use crate::messages::tool::common_functionality::shape_editor::{
 	ClosestSegment, ManipulatorAngle, OpposingHandleLengths, SelectedLayerState, SelectedPointsInfo, SelectionChange, SelectionShape, SelectionShapeType, ShapeState,
 };
-use crate::messages::tool::common_functionality::snap_session::{FeatureMap, Locus, Moving, PointOptions, SnapSession, SnapView, nudge_translation, snapping_hints};
+use crate::messages::tool::common_functionality::snap_session::{ExtensionTrack, FeatureMap, Locus, Moving, PointOptions, SnapSession, SnapView, nudge_translation, snapping_hints};
 use crate::messages::tool::common_functionality::utility_functions::{calculate_segment_angle, find_two_param_best_approximate, make_path_editable_is_allowed};
 use graphene_std::Color;
 use graphene_std::list::List;
@@ -568,6 +568,14 @@ enum PathToolFsmState {
 /// The most selected points that snap while being dragged together, counting the one under the pointer.
 pub const MAX_SNAPPING_POINTS: usize = 16;
 
+/// An extension line candidate along a path segment's direction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExtensionLine {
+	pub locus: Locus,
+	pub direction: DVec2,
+	pub reference: DVec2,
+}
+
 /// The selected points being dragged, which slide together by however far the pointer asks from where the drag began.
 #[derive(Clone, Debug, Default)]
 struct Slide {
@@ -577,6 +585,8 @@ struct Slide {
 	features: Vec<FeatureMap>,
 	/// The unselected anchor that the point under the pointer joins back to with a straight segment.
 	previous: Option<DVec2>,
+	/// Extension lines from unselected neighbor(s) connected to the point under the pointer.
+	extension_lines: Vec<ExtensionLine>,
 }
 
 #[derive(Default)]
@@ -995,6 +1005,7 @@ impl PathToolData {
 
 		let mut starts = Vec::new();
 		let mut previous = None;
+		let mut extension_lines = Vec::new();
 		for (&layer, state) in &shape_editor.selected_shape_state {
 			let Some(vector) = document.network_interface.compute_modified_vector(layer) else { continue };
 			let to_document = document.metadata().transform_to_document_if_feeds(layer, &document.network_interface);
@@ -1006,9 +1017,11 @@ impl PathToolData {
 
 				if let Some(anchor) = point.as_anchor()
 					&& point_start.abs_diff_eq(start, 1e-6)
-					&& let Some(neighbor) = unselected_neighbor_joined_straight(anchor, state, &vector)
 				{
-					previous = Some(to_document.transform_point2(neighbor));
+					if let Some(neighbor) = unselected_neighbor_joined_straight(anchor, state, &vector) {
+						previous = Some(to_document.transform_point2(neighbor));
+					}
+					extension_lines = find_extension_lines(anchor, state, &vector, to_document);
 				}
 			}
 		}
@@ -1019,33 +1032,82 @@ impl PathToolData {
 		starts.truncate(MAX_SNAPPING_POINTS - 1);
 
 		let features = std::iter::once(start).chain(starts).map(FeatureMap::sliding_from).collect();
-		self.slide = Some(Slide { start, features, previous });
+		self.slide = Some(Slide {
+			start,
+			features,
+			previous,
+			extension_lines,
+		});
 	}
 
 	/// Slides the selected points by however far the pointer asks from where the drag began, snapping whichever of them lands best, and returns how far they move in the viewport.
-	fn slide_selected_points(&self, snap_session: &mut SnapSession, view: SnapView) -> DVec2 {
+	fn slide_selected_points(&self, snap_session: &mut SnapSession, view: SnapView, lock_angle: bool) -> DVec2 {
 		let document_to_viewport = view.document.metadata().document_to_viewport;
 		let pointer = document_to_viewport.inverse().transform_point2(view.input.mouse.position);
 		let Some(slide) = &self.slide else {
 			return document_to_viewport.transform_vector2(pointer - self.previous_mouse_position);
 		};
 
-		// The axis lock holds the slide to a screen axis through where the point under the pointer began
-		let required = self.snapping_axis.and_then(|axis| {
-			let screen_axis = match axis {
-				Axis::Y => DVec2::Y,
-				Axis::X | Axis::Both => DVec2::X,
-			};
-			Locus::line(DVec2::ZERO, document_to_viewport.inverse().transform_vector2(screen_axis))
-		});
-
 		let free = pointer - slide.start;
+
+		// Axis constraint:
+		// 1. If lock_angle (Control) is held and there are extension lines, lock to the extension line nearest current motion
+		// 2. If snapping_axis (Shift) is active, check if motion is closer to an extension line than to Screen X or Screen Y.
+		//    If so, constrain along that extension line; otherwise constrain along the screen axis.
+		let mut required = None;
+		if lock_angle && !slide.extension_lines.is_empty() {
+			let best_ext = slide.extension_lines.iter().max_by(|a, b| {
+				let dot_a = a.direction.dot(free).abs();
+				let dot_b = b.direction.dot(free).abs();
+				dot_a.total_cmp(&dot_b)
+			});
+			if let Some(ext) = best_ext {
+				required = Locus::line(DVec2::ZERO, ext.direction);
+			}
+		} else if self.snapping_axis.is_some() {
+			let screen_travel = document_to_viewport.transform_vector2(free);
+			let travel_x = screen_travel.x.abs();
+			let travel_y = screen_travel.y.abs();
+
+			let best_ext = slide
+				.extension_lines
+				.iter()
+				.map(|ext| {
+					let screen_dir = document_to_viewport.transform_vector2(ext.direction).normalize_or_zero();
+					let projection = screen_travel.dot(screen_dir).abs();
+					(ext, projection)
+				})
+				.max_by(|a, b| a.1.total_cmp(&b.1));
+
+			if let Some((ext, ext_proj)) = best_ext
+				&& ext_proj > travel_x
+				&& ext_proj > travel_y
+			{
+				required = Locus::line(DVec2::ZERO, ext.direction);
+			} else {
+				let screen_axis = match self.snapping_axis {
+					Some(Axis::Y) => DVec2::Y,
+					_ => DVec2::X,
+				};
+				required = Locus::line(DVec2::ZERO, document_to_viewport.inverse().transform_vector2(screen_axis));
+			}
+		}
+
 		let slid = if slide.features.is_empty() {
 			required.map_or(free, |axis| axis.nearest(free))
 		} else {
+			let mut extension_tracks = [None; 4];
+			for (track_slot, ext) in extension_tracks.iter_mut().zip(&slide.extension_lines) {
+				*track_slot = Some(ExtensionTrack {
+					line: ext.locus,
+					reference: ext.reference,
+				});
+			}
+
 			let options = PointOptions {
 				previous: slide.previous,
 				required,
+				extension_tracks,
 				..Default::default()
 			};
 			snap_session.snap_features(view, &slide.features, 0, free, options)
@@ -1496,7 +1558,7 @@ impl PathToolData {
 			let snapped = snap_session.snap_point(view, constrained_target, options);
 			document_to_viewport.transform_vector2(snapped - handle_position)
 		} else {
-			self.slide_selected_points(snap_session, view)
+			self.slide_selected_points(snap_session, view, lock_angle)
 		};
 
 		let handle_lengths = if equidistant { None } else { self.opposing_handle_lengths.take() };
@@ -3444,6 +3506,53 @@ fn unselected_neighbor_joined_straight(anchor: PointId, state: &SelectedLayerSta
 	vector.position_from_id(neighbor)
 }
 
+/// Finds lines extending the path in the direction(s) it faces at `anchor`, from the unselected neighbor.
+fn find_extension_lines(anchor: PointId, state: &SelectedLayerState, vector: &VectorGeometry, to_document: DAffine2) -> Vec<ExtensionLine> {
+	let mut unselected = vector.connected_points(anchor).filter(|&neighbor| !state.is_point_selected(ManipulatorPointId::Anchor(neighbor)));
+	let (Some(neighbor), None) = (unselected.next(), unselected.next()) else { return Vec::new() };
+
+	let Some(anchor_pos) = vector.position_from_id(anchor) else { return Vec::new() };
+	let anchor_doc = to_document.transform_point2(anchor_pos);
+
+	let Some(neighbor_pos) = vector.position_from_id(neighbor) else { return Vec::new() };
+	let neighbor_doc = to_document.transform_point2(neighbor_pos);
+
+	let chord_vector = anchor_doc - neighbor_doc;
+	let Some(chord_dir) = chord_vector.try_normalize() else { return Vec::new() };
+
+	let mut lines = Vec::new();
+
+	// Add chord line
+	if let Some(locus) = Locus::line(anchor_doc, chord_dir) {
+		lines.push(ExtensionLine {
+			locus,
+			direction: chord_dir,
+			reference: neighbor_doc,
+		});
+	}
+
+	// Find the segment between anchor and neighbor to get the tangent
+	if let Some((_, segment, start, _)) = vector.segment_iter().find(|&(_, _, s, e)| (s == anchor && e == neighbor) || (s == neighbor && e == anchor)) {
+		// Tangent extending away from the path at the anchor
+		let outward_tangent = if start == anchor { -pathseg_tangent(segment, 0.) } else { pathseg_tangent(segment, 1.) };
+		let tangent_dir = to_document.transform_vector2(outward_tangent).try_normalize();
+
+		// Add tangent line if it differs significantly from the chord line
+		if let Some(tangent_dir) = tangent_dir
+			&& chord_dir.perp_dot(tangent_dir).abs() >= 1e-4
+			&& let Some(locus) = Locus::line(anchor_doc, tangent_dir)
+		{
+			lines.push(ExtensionLine {
+				locus,
+				direction: tangent_dir,
+				reference: anchor_doc,
+			});
+		}
+	}
+
+	lines
+}
+
 /// The document positions of the selected points, along with both ends of each selected segment.
 fn selected_positions_in_document(shape_editor: &ShapeState, document: &DocumentMessageHandler) -> impl Iterator<Item = DVec2> {
 	shape_editor.selected_shape_state.iter().flat_map(|(&layer, state)| {
@@ -3694,7 +3803,13 @@ fn update_dynamic_hints(
 					hints.push(drag_anchor);
 					hints
 				}
-				PointSelectState::Anchor => Vec::new(),
+				PointSelectState::Anchor => {
+					let mut hints = vec![HintInfo::keys([Key::Shift], "Constrain to Axis")];
+					if tool_data.slide.as_ref().is_some_and(|slide| !slide.extension_lines.is_empty()) {
+						hints.push(HintInfo::keys([Key::Control], "Lock Path Angle"));
+					}
+					hints
+				}
 			};
 
 			if !toggle_group.is_empty() {
@@ -4163,5 +4278,79 @@ mod test_path_tool {
 
 		let after = handle_in_document(&editor, handle);
 		assert!(after.distance(before + DVec2::new(5., 0.)) < 1e-6, "the handle moved from {before} to {after}");
+	}
+
+	#[tokio::test]
+	async fn an_anchor_dragged_near_its_segment_direction_snaps_to_extension() {
+		let mut editor = EditorTestUtils::create();
+		editor.new_document().await;
+		let p0 = DVec2::new(100., 100.);
+		let p1 = DVec2::new(200., 200.);
+		let layer = draw_path(&mut editor, &[p0, p1]).await;
+
+		// Drag p1 to (250., 253.), which is 3 pixels off the 45-degree extension line
+		// The perpendicular projection of (250., 253.) onto y = x is (251.5, 251.5)
+		drag(&mut editor, p1, DVec2::new(250., 253.)).await;
+		assert_anchors(&editor, layer, &[p0, DVec2::new(251.5, 251.5)]);
+	}
+
+	#[tokio::test]
+	async fn an_anchor_dragged_with_control_held_locks_to_extension_direction() {
+		let mut editor = EditorTestUtils::create();
+		editor.new_document().await;
+		let p0 = DVec2::new(100., 100.);
+		let p1 = DVec2::new(200., 200.);
+		let layer = draw_path(&mut editor, &[p0, p1]).await;
+
+		// Drag with Control held far off the 45-degree line to (300., 250.)
+		press_at(&mut editor, p1).await;
+		let target = DVec2::new(300., 250.);
+		move_to(&mut editor, target, ModifierKeys::CONTROL).await;
+		editor.left_mouseup(target.x, target.y, ModifierKeys::CONTROL).await;
+
+		// Projection of (300., 250.) onto 45-degree line through (200., 200.) lands at (275., 275.)
+		assert_anchors(&editor, layer, &[p0, DVec2::new(275., 275.)]);
+	}
+
+	#[tokio::test]
+	async fn an_anchor_dragged_with_shift_held_constrains_to_extension_axis() {
+		let mut editor = EditorTestUtils::create();
+		editor.new_document().await;
+		let p0 = DVec2::new(100., 100.);
+		let p1 = DVec2::new(300., 200.);
+		let layer = draw_path(&mut editor, &[p0, p1]).await;
+
+		press_at(&mut editor, p1).await;
+		let target = p1 + DVec2::new(100., 52.);
+		move_to(&mut editor, target, ModifierKeys::SHIFT).await;
+		editor.left_mouseup(target.x, target.y, ModifierKeys::SHIFT).await;
+
+		let expected = p1 + DVec2::new(100.8, 50.4);
+		let current_anchors = anchors(&editor, layer);
+		assert!(current_anchors[1].distance(expected) < 1e-4, "expected {expected}, got {}", current_anchors[1]);
+	}
+
+	#[tokio::test]
+	async fn a_curved_segment_endpoint_dragged_near_its_chord_direction_snaps_to_extension() {
+		let mut editor = EditorTestUtils::create();
+		editor.new_document().await;
+		let start = DVec2::new(100., 100.);
+		let anchor = DVec2::new(200., 200.);
+		let dragged_out = DVec2::new(260., 225.);
+
+		// Draw curve from start to anchor with a handle
+		editor.click_tool(ToolType::Pen, MouseKeys::LEFT, start, ModifierKeys::empty()).await;
+		editor.move_mouse(anchor.x, anchor.y, ModifierKeys::empty(), MouseKeys::empty()).await;
+		editor.left_mousedown(anchor.x, anchor.y, ModifierKeys::empty()).await;
+		editor.move_mouse(dragged_out.x, dragged_out.y, ModifierKeys::empty(), MouseKeys::LEFT).await;
+		editor.left_mouseup(dragged_out.x, dragged_out.y, ModifierKeys::empty()).await;
+		editor.press(Key::Enter, ModifierKeys::empty()).await;
+
+		let layer = editor.get_selected_layer().await.expect("the drawn path should be selected");
+
+		// Drag anchor near the chord line (start -> anchor is (100, 100) to (200, 200), slope 1)
+		// Drag to (250., 253.), 3 pixels off y = x, which perpendicularly projects to (251.5, 251.5)
+		drag(&mut editor, anchor, DVec2::new(250., 253.)).await;
+		assert_anchors(&editor, layer, &[start, DVec2::new(251.5, 251.5)]);
 	}
 }
