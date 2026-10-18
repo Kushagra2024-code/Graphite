@@ -456,6 +456,9 @@ struct PenToolData {
 	handle_type: TargetHandle,
 	handle_start_offset: Option<DVec2>,
 	handle_end_offset: Option<DVec2>,
+	/// Document-space start position for newly created layers, used to compute local-space
+	/// positions before the deferred TransformSet has been reflected in metadata.
+	new_layer_document_start: Option<DVec2>,
 }
 
 impl PenToolData {
@@ -474,9 +477,28 @@ impl PenToolData {
 	}
 
 	fn cleanup(&mut self, snap_session: &mut SnapSession, responses: &mut VecDeque<Message>) {
+		self.new_layer_document_start = None;
+		self.current_layer = None;
 		self.handle_end = None;
 		self.latest_points.clear();
 		self.point_index = 0;
+		self.next_point = DVec2::ZERO;
+		self.next_handle_start = DVec2::ZERO;
+		self.path_closed = false;
+		self.handle_mode = HandleMode::Free;
+		self.prior_segment_layer = None;
+		self.prior_segment_endpoint = None;
+		self.prior_segment = None;
+		self.prior_segments = None;
+		self.handle_start_offset = None;
+		self.handle_end_offset = None;
+		self.handle_swapped = false;
+		self.toggle_colinear_debounce = false;
+		self.space_pressed = false;
+		self.alt_pressed = false;
+		self.anchor_slide.clear();
+		self.switch_to_free_on_ctrl_release = false;
+		self.angle_locked = false;
 		self.suppress_lock_angle = false;
 		self.suppress_snap_angle = false;
 		self.merging_from = None;
@@ -932,15 +954,14 @@ impl PenToolData {
 		shape_editor: &mut ShapeState,
 		input: &InputPreprocessorMessageHandler,
 		responses: &mut VecDeque<Message>,
+		transform: DAffine2,
 	) {
 		// Validate necessary data exists
 		let Some(vector) = layer.and_then(|layer| document.network_interface.compute_modified_vector(layer)) else {
 			return;
 		};
 
-		let Some(viewport) = layer.map(|layer| document.metadata().transform_to_viewport(layer)) else {
-			return;
-		};
+		let viewport = document.metadata().document_to_viewport * transform;
 
 		// Determine if we need to swap to opposite handle
 		let should_swap_to_opposite = self.path_closed && matches!(self.handle_type, TargetHandle::PreviewInHandle | TargetHandle::PriorOutHandle(..) | TargetHandle::PriorInHandle(..))
@@ -959,7 +980,7 @@ impl PenToolData {
 			if (handle_pos - self.next_point).length() < 1e-6 {
 				self.handle_swapped = false;
 				return;
-			}
+			};
 			self.handle_end_offset = Some(viewport.transform_point2(handle_pos) - input.mouse.position);
 
 			// Update selections if in closed path mode
@@ -972,10 +993,7 @@ impl PenToolData {
 			self.cleanup_target_selections(shape_editor, layer, document, responses);
 
 			// Calculate offset from mouse position to next handle start
-			if let Some(layer_id) = layer {
-				let transform = document.metadata().transform_to_viewport(layer_id);
-				self.handle_start_offset = Some(transform.transform_point2(self.next_handle_start) - input.mouse.position);
-			}
+			self.handle_start_offset = Some(viewport.transform_point2(self.next_handle_start) - input.mouse.position);
 
 			self.update_handle_type(TargetHandle::FuturePreviewOutHandle);
 		}
@@ -1276,6 +1294,7 @@ impl PenToolData {
 		start: DVec2,
 	) -> LayerNodeIdentifier {
 		self.handle_type = TargetHandle::FuturePreviewOutHandle;
+		self.new_layer_document_start = None;
 
 		let selected_nodes = document.network_interface.selected_nodes();
 		self.handle_end = None;
@@ -1355,6 +1374,9 @@ impl PenToolData {
 		self.next_handle_start = DVec2::ZERO;
 		self.handle_end = None;
 
+		let document_start = document.metadata().document_to_viewport.inverse().transform_point2(start);
+		self.new_layer_document_start = Some(document_start);
+
 		// Defer the transform setup and point insertion until after the layer is created
 		responses.add(DeferMessage::AfterGraphRun {
 			messages: vec![
@@ -1364,6 +1386,7 @@ impl PenToolData {
 					modification_type: VectorModificationType::InsertPoint { id, position: DVec2::ZERO },
 				}
 				.into(),
+				NodeGraphMessage::RunDocumentGraph.into(),
 			],
 		});
 		responses.add(NodeGraphMessage::RunDocumentGraph);
@@ -1516,6 +1539,22 @@ impl Fsm for PenToolFsmState {
 		let layer = selected_layers.next().filter(|_| selected_layers.next().is_none()).or(tool_data.current_layer);
 
 		let mut transform = layer.map(|layer| document.metadata().transform_to_document(layer)).unwrap_or_default();
+
+		// For newly created layers, the deferred TransformSet may not yet be reflected
+		// in the metadata, so use the known document start position.
+		// Once the metadata catches up (origin maps to start), switch to using it.
+		if let Some(expected_start) = tool_data.new_layer_document_start {
+			if layer.is_some_and(|l| tool_data.current_layer == Some(l)) {
+				let current_origin = transform.transform_point2(DVec2::ZERO);
+				if current_origin.abs_diff_eq(expected_start, 1e-5) {
+					tool_data.new_layer_document_start = None;
+				} else {
+					transform = DAffine2::from_translation(expected_start);
+				}
+			} else {
+				tool_data.new_layer_document_start = None;
+			}
+		}
 
 		if !transform.inverse().is_finite() {
 			let parent_transform = layer.and_then(|layer| layer.parent(document.metadata())).map(|layer| document.metadata().transform_to_document(layer));
@@ -2072,12 +2111,8 @@ impl Fsm for PenToolFsmState {
 					} else {
 						TargetHandle::FuturePreviewOutHandle
 					};
-					let handle_start = layer.map(|layer| {
-						document
-							.metadata()
-							.transform_to_viewport(layer)
-							.transform_point2(tool_data.target_handle_position(reference_handle, &vector).unwrap())
-					});
+					let layer_to_viewport = document.metadata().document_to_viewport * transform;
+					let handle_start = layer.and_then(|_| tool_data.target_handle_position(reference_handle, &vector).map(|pos| layer_to_viewport.transform_point2(pos)));
 					tool_data.handle_start_offset = handle_start.map(|start| start - input.mouse.position);
 					tool_data.space_pressed = true;
 				}
@@ -2168,7 +2203,7 @@ impl Fsm for PenToolFsmState {
 				if !tool_data.handle_swapped {
 					tool_data.handle_swapped = true
 				}
-				tool_data.swap_handles(layer, document, shape_editor, input, responses);
+				tool_data.swap_handles(layer, document, shape_editor, input, responses, transform);
 				responses.add(OverlaysMessage::Draw);
 				self
 			}
@@ -3032,5 +3067,60 @@ mod test_pen_tool {
 		let outgoing = vector.position_of(ManipulatorPointId::PrimaryHandle(segment)).expect("The segment should have an outgoing handle");
 		let outgoing = editor.active_document().metadata().transform_to_viewport(layer).transform_point2(outgoing);
 		assert!(outgoing.distance(handle + travel) < 1e-6, "the handle is at {outgoing} rather than {}", handle + travel);
+	}
+
+	#[tokio::test]
+	async fn single_click_with_pointer_move_does_not_start_as_dragged() {
+		let mut editor = EditorTestUtils::create();
+		editor.new_document().await;
+		editor.select_tool(ToolType::Pen).await;
+
+		let start = DVec2::new(300., 400.);
+		editor.move_mouse(start.x, start.y, ModifierKeys::empty(), MouseKeys::empty()).await;
+		editor.left_mousedown(start.x, start.y, ModifierKeys::empty()).await;
+		// Micro-move while mouse is down (simulating click jitter or mouse move event during click)
+		editor.move_mouse(start.x, start.y, ModifierKeys::empty(), MouseKeys::LEFT).await;
+		editor.left_mouseup(start.x, start.y, ModifierKeys::empty()).await;
+
+		// Add a second point to form a segment
+		let next = DVec2::new(500., 400.);
+		click_pen(&mut editor, next).await;
+
+		let (layer, vector) = drawn_path(&editor).expect("Expected a drawn path");
+		let layer_to_viewport = editor.active_document().metadata().transform_to_viewport(layer);
+		let segment = vector.segment_ids()[0];
+		let outgoing = vector.position_of(ManipulatorPointId::PrimaryHandle(segment));
+		if let Some(outgoing_pos) = outgoing {
+			let outgoing_viewport = layer_to_viewport.transform_point2(outgoing_pos);
+			assert!(outgoing_viewport.distance(start) < 1e-4, "Primary handle should be at start {start}, but was at {outgoing_viewport}");
+		}
+	}
+
+	#[tokio::test]
+	async fn dragging_initial_point_handle_uses_correct_transform() {
+		let mut editor = EditorTestUtils::create();
+		editor.new_document().await;
+		editor.select_tool(ToolType::Pen).await;
+
+		let start = DVec2::new(300., 400.);
+		let drag_to = DVec2::new(350., 420.);
+		editor.move_mouse(start.x, start.y, ModifierKeys::empty(), MouseKeys::empty()).await;
+		editor.left_mousedown(start.x, start.y, ModifierKeys::empty()).await;
+		editor.move_mouse(drag_to.x, drag_to.y, ModifierKeys::empty(), MouseKeys::LEFT).await;
+		editor.left_mouseup(drag_to.x, drag_to.y, ModifierKeys::empty()).await;
+
+		// Add a second point to form a segment
+		let next = DVec2::new(500., 400.);
+		click_pen(&mut editor, next).await;
+
+		let (layer, vector) = drawn_path(&editor).expect("Expected a drawn path");
+		let layer_to_viewport = editor.active_document().metadata().transform_to_viewport(layer);
+		let segment = vector.segment_ids()[0];
+		let outgoing = vector.position_of(ManipulatorPointId::PrimaryHandle(segment)).expect("Expected an outgoing handle");
+		let outgoing_viewport = layer_to_viewport.transform_point2(outgoing);
+		assert!(
+			outgoing_viewport.distance(drag_to) < 1e-4,
+			"Primary handle should be at drag_to {drag_to}, but was at {outgoing_viewport}"
+		);
 	}
 }
