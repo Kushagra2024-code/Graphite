@@ -11,9 +11,7 @@ use crate::messages::tool::tool_messages::path_tool::{PathOverlayMode, PointSele
 use glam::{DAffine2, DVec2};
 use graphene_std::vector::algorithms::bezpath_algorithms::pathseg_compute_lookup_table;
 use graphene_std::vector::algorithms::shapes::polyline_bezpath;
-use graphene_std::vector::misc::{
-	BezierHandles, HandleId, HandleType, ManipulatorPointId, PathSegPoints, bezpath_from_manipulator_groups, dvec2_to_point, pathseg_points, point_to_dvec2, segment_to_handles,
-};
+use graphene_std::vector::misc::{BezierHandles, HandleId, HandleType, ManipulatorPointId, bezpath_from_manipulator_groups, dvec2_to_point, pathseg_points, point_to_dvec2, segment_to_handles};
 use graphene_std::vector::{HandleExt, PointId, SegmentId, VectorGeometry, VectorModificationType};
 use kurbo::{Affine, DEFAULT_ACCURACY, Line, ParamCurve, ParamCurveNearest, PathSeg, Rect, Shape};
 use std::f64::consts::TAU;
@@ -1777,6 +1775,18 @@ impl ShapeState {
 		let colinear_pairs = vector.colinear_pairs();
 
 		for (segment_id, mut segment, start, end) in vector.segment_iter() {
+			// Convert to linear if handles are on top of control points
+			let eps_sq = (f64::EPSILON * 100.).powi(2);
+			match segment {
+				PathSeg::Cubic(cubic) if cubic.p1.distance_squared(cubic.p0) <= eps_sq && cubic.p2.distance_squared(cubic.p3) <= eps_sq => {
+					segment = PathSeg::Line(Line::new(cubic.p0, cubic.p3));
+				}
+				PathSeg::Quad(quad) if quad.p1.distance_squared(quad.p0) <= eps_sq || quad.p1.distance_squared(quad.p2) <= eps_sq => {
+					segment = PathSeg::Line(Line::new(quad.p0, quad.p2));
+				}
+				_ => {}
+			}
+
 			let t = segment.nearest(dvec2_to_point(layer_pos), DEFAULT_ACCURACY).t;
 			let layerspace = point_to_dvec2(segment.eval(t));
 
@@ -1785,15 +1795,6 @@ impl ShapeState {
 
 			if distance_squared < closest_distance_squared {
 				closest_distance_squared = distance_squared;
-
-				// Convert to linear if handes are on top of control points
-				let PathSegPoints { p0: _, p1, p2, p3: _ } = pathseg_points(segment);
-				if let (Some(p1), Some(p2)) = (p1, p2) {
-					let segment_points = pathseg_points(segment);
-					if p1.abs_diff_eq(segment_points.p0, f64::EPSILON * 100.) && p2.abs_diff_eq(segment_points.p3, f64::EPSILON * 100.) {
-						segment = PathSeg::Line(Line::new(segment.start(), segment.end()));
-					}
-				}
 
 				let primary_handle = colinear_pairs.iter().copied().find(|handles| handles.contains(&HandleId::primary(segment_id)));
 				let end_handle = colinear_pairs.iter().copied().find(|handles| handles.contains(&HandleId::end(segment_id)));

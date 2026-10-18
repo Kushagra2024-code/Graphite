@@ -3033,4 +3033,40 @@ mod test_pen_tool {
 		let outgoing = editor.active_document().metadata().transform_to_viewport(layer).transform_point2(outgoing);
 		assert!(outgoing.distance(handle + travel) < 1e-6, "the handle is at {outgoing} rather than {}", handle + travel);
 	}
+
+	#[tokio::test]
+	async fn inserting_point_on_straight_segment_places_anchor_at_pointer_location() {
+		let mut editor = EditorTestUtils::create();
+		editor.new_document().await;
+
+		let start = DVec2::new(100., 100.);
+		let end = DVec2::new(300., 100.);
+		click_pen(&mut editor, start).await;
+		click_pen(&mut editor, end).await;
+		assert_anchors(&editor, &[start, end]);
+
+		// Exit placement of the first path
+		editor.press(Key::Escape, ModifierKeys::empty()).await;
+
+		// Select the path layer so it can be split by pen tool
+		let (layer, _) = drawn_path(&editor).expect("Expected a drawn path");
+		editor.handle_message(NodeGraphMessage::SelectedNodesSet { nodes: vec![layer.to_node()] }).await;
+
+		// Click at 20% along the segment (start.x + (end.x - start.x) * 0.2 = 140.)
+		let insert_location = DVec2::new(140., 100.);
+		click_pen(&mut editor, insert_location).await;
+
+		let (layer, vector) = drawn_path(&editor).expect("Expected a drawn path");
+		let layer_to_viewport = editor.active_document().metadata().transform_to_viewport(layer);
+		let inserted_anchor = vector
+			.anchor_points()
+			.find(|&id| {
+				let pos = layer_to_viewport.transform_point2(vector.position_from_id(id).unwrap());
+				pos.distance(start) > 1. && pos.distance(end) > 1.
+			})
+			.expect("Expected inserted anchor");
+
+		let inserted_pos = layer_to_viewport.transform_point2(vector.position_from_id(inserted_anchor).unwrap());
+		assert!(inserted_pos.distance(insert_location) < 1e-4, "Anchor placed at {inserted_pos:?}, expected at {insert_location:?}");
+	}
 }
